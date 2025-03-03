@@ -5,23 +5,64 @@ from datetime import datetime
 import asyncio
 import random
 import os
-from typing import Dict, List, Optional, AsyncGenerator
+import sys
+from typing import Dict, List, Optional, AsyncGenerator, Set
+from urllib.parse import urlencode
 from browser_use import Agent, Browser, Controller, ActionResult
 from browser_use.browser.browser import BrowserConfig
 from browser_use.browser.context import BrowserContextConfig, BrowserContext
+from langchain.chat_models.base import BaseChatModel
 
 from ..storage.models import Job, ApplyType
+
+def find_chrome_windows():
+    """Find Chrome executable in common Windows locations."""
+    common_locations = [
+        "C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe",
+        "C:\\Program Files (x86)\\Google\\Chrome\\Application\\chrome.exe",
+        os.path.expanduser("~") + "\\AppData\\Local\\Google\\Chrome\\Application\\chrome.exe",
+    ]
+    
+    for location in common_locations:
+        if os.path.exists(location):
+            return location
+    return None
 
 class LinkedInJobSearch:
     """LinkedIn job search functionality."""
     
-    def __init__(self, credentials: Dict[str, str]):
-        """Initialize LinkedIn job searcher."""
+    # Experience level mapping
+    EXPERIENCE_LEVELS = {
+        "internship": "1",
+        "entry": "2",
+        "associate": "3",
+        "mid-senior": "4",
+        "director": "5",
+        "executive": "6"
+    }
+    
+    def __init__(
+        self, 
+        credentials: Dict[str, str], 
+        llm: Optional[BaseChatModel] = None, 
+        model_name: str = "gpt-4-mini",
+        chrome_path: Optional[str] = None
+    ):
+        """Initialize LinkedIn job searcher.
+        
+        Args:
+            credentials: LinkedIn credentials (username, password)
+            llm: Optional pre-configured LLM instance
+            model_name: Model name to use if llm not provided
+            chrome_path: Optional path to Chrome executable
+        """
         self.credentials = credentials
+        self.llm = llm
+        self.model_name = model_name
         
         # Initialize browser with config
         self.browser_config = BrowserConfig(
-            chrome_instance_path=os.getenv("CHROME_PATH"),  # Get chrome path from env
+            chrome_instance_path=chrome_path,
             disable_security=True,
         )
         self.context_config = BrowserContextConfig(
@@ -34,48 +75,59 @@ class LinkedInJobSearch:
         self.context = BrowserContext(browser=self.browser, config=self.context_config)
 
     async def login(self):
-        """Login to LinkedIn."""
-        page = await self.context.get_current_page()
-        await self.context.navigate_to("https://www.linkedin.com/login")
+        """Login to LinkedIn using browser-use Agent."""
+        # Create login agent with sensitive data
+        agent_login = Agent(
+            task='go to linkedin.com and login with x_name and x_password.',
+            llm=self.llm,  # Use LLM from interface
+            sensitive_data={
+                'x_name': self.credentials["username"],
+                'x_password': self.credentials["password"]
+            },
+            browser_context=self.context
+        )
         
-        # Fill in credentials
-        await page.fill("#username", self.credentials["username"])
-        await page.fill("#password", self.credentials["password"])
-        
-        # Click login button
-        await page.click(".login__form_action_container button")
-        await page.wait_for_load_state("networkidle")
+        # Run login agent
+        await agent_login.run()
+        await asyncio.sleep(1)  # Wait for login to complete
 
-    async def search_jobs(
-        self,
-        keywords: List[str],
-        location: Optional[str] = None,
-        experience_levels: Optional[List[str]] = None
-    ) -> AsyncGenerator[Job, None]:
-        """Search for jobs on LinkedIn."""
-        # Build search URL
-        base_url = "https://www.linkedin.com/jobs/search/?"
-        params = [f"keywords={'+'.join(keywords)}"]
+    def _build_search_url(self, keywords: List[str], location: Optional[str], experience_levels: Optional[List[str]]) -> str:
+        """Build LinkedIn job search URL with parameters.
+        
+        Args:
+            keywords: List of search keywords
+            location: Optional location filter
+            experience_levels: Optional list of experience levels
+            
+        Returns:
+            Complete search URL
+        """
+        params = {"keywords": " ".join(keywords)}
+        
         if location:
-            params.append(f"location={location}")
+            params["location"] = location
+            
         if experience_levels:
-            level_codes = {
-                "internship": "1", "entry": "2", "associate": "3",
-                "mid-senior": "4", "director": "5", "executive": "6"
-            }
-            codes = [level_codes[level] for level in experience_levels if level in level_codes]
+            codes = [self.EXPERIENCE_LEVELS[level.lower()] 
+                    for level in experience_levels 
+                    if level.lower() in self.EXPERIENCE_LEVELS]
             if codes:
-                params.append(f"f_E={','.join(codes)}")
-        search_url = base_url + "&".join(params)
+                params["f_E"] = ",".join(codes)
+                
+        return f"https://www.linkedin.com/jobs/search/?{urlencode(params)}"
 
-        # Navigate to search results
-        page = await self.context.get_current_page()
-        await self.context.navigate_to(search_url)
-        await asyncio.sleep(2)
-
-        # Collect job IDs while scrolling
+    async def _collect_job_ids(self, page, num_scrolls: int = 6) -> Set[str]:
+        """Collect job IDs by scrolling through search results.
+        
+        Args:
+            page: Browser page object
+            num_scrolls: Number of times to scroll down
+            
+        Returns:
+            Set of job IDs
+        """
         job_ids = set()
-        for _ in range(6):
+        for _ in range(num_scrolls):
             # Get job IDs in current view
             new_ids = await page.evaluate('''
                 Array.from(document.querySelectorAll("[data-job-id]"))
@@ -86,81 +138,129 @@ class LinkedInJobSearch:
             # Scroll down
             await page.evaluate('window.scrollBy(0, 800)')
             await asyncio.sleep(random.uniform(0.8, 1.8))
+            
+        return job_ids
+
+    async def _extract_job_info(self, page) -> Dict[str, Optional[str]]:
+        """Extract job information from the current page.
+        
+        Args:
+            page: Browser page object
+            
+        Returns:
+            Dictionary containing job details
+        """
+        # Extract basic info
+        job_title = await page.evaluate('''
+            document.querySelector('.t-24.job-details-jobs-unified-top-card__job-title')?.innerText || ''
+        ''')
+        
+        company_name = await page.evaluate('''
+            document.querySelector('.job-details-jobs-unified-top-card__company-name')?.innerText || ''
+        ''')
+        
+        second_head = await page.evaluate('''
+            document.querySelector('.job-details-jobs-unified-top-card__primary-description-container')?.innerText || ''
+        ''')
+        
+        # Parse location info
+        location = posted_days_ago = ppl_applied = None
+        if len(second_head.split('·')) == 3:
+            parts = [part.strip() for part in second_head.split('·')]
+            location, posted_days_ago, ppl_applied = parts
+            
+        return {
+            "job_title": job_title,
+            "company_name": company_name,
+            "location": location,
+            "posted_days_ago": posted_days_ago,
+            "ppl_applied": ppl_applied,
+            "raw_description": second_head
+        }
+
+    async def _get_apply_info(self, page) -> Dict[str, str]:
+        """Get application button information.
+        
+        Args:
+            page: Browser page object
+            
+        Returns:
+            Dictionary with apply link and type
+        """
+        apply_info = await page.evaluate('''(() => {
+            const applyButton = document.querySelector('.jobs-apply-button');
+            if (applyButton) {
+                const buttonText = applyButton.querySelector('.artdeco-button__text')?.innerText || '';
+                const isEasyApply = buttonText.includes('Easy Apply');
+                if (isEasyApply) {
+                    return {
+                        link: `https://www.linkedin.com/jobs/view/${jobId}/`,
+                        type: 'Easy Apply'
+                    };
+                }
+                return {
+                    link: null,
+                    type: 'Apply'
+                };
+            }
+            return {
+                link: window.location.href,
+                type: 'Unknown'
+            };
+        })()''')
+        
+        # Handle regular Apply button (gets external URL)
+        if apply_info['type'] == 'Apply' and not apply_info['link']:
+            try:
+                popup_promise = page.wait_for_event("popup")
+                await page.click('.jobs-apply-button')
+                popup = await popup_promise
+                await popup.wait_for_load_state()
+                apply_info['link'] = popup.url
+                await popup.close()
+            except:
+                apply_info['link'] = page.url
+                
+        return apply_info
+
+    async def search_jobs(
+        self,
+        keywords: List[str],
+        location: Optional[str] = None,
+        experience_levels: Optional[List[str]] = None
+    ) -> AsyncGenerator[Job, None]:
+        """Search for jobs on LinkedIn."""
+        # Build and navigate to search URL
+        search_url = self._build_search_url(keywords, location, experience_levels)
+        page = await self.context.get_current_page()
+        await self.context.navigate_to(search_url)
+        await asyncio.sleep(2)
+
+        # Collect job IDs
+        job_ids = await self._collect_job_ids(page)
 
         # Process each job
         for job_id in job_ids:
+            # Navigate to job details
             job_url = f'https://www.linkedin.com/jobs/search/?currentJobId={job_id}'
             await self.context.navigate_to(job_url)
             await asyncio.sleep(2)
 
-            # Extract job details using JavaScript
-            job_title = await page.evaluate('''
-                document.querySelector('.t-24.job-details-jobs-unified-top-card__job-title')?.innerText || ''
-            ''')
-
-            company_name = await page.evaluate('''
-                document.querySelector('.job-details-jobs-unified-top-card__company-name')?.innerText || ''
-            ''')
-
-            second_head = await page.evaluate('''
-                document.querySelector('.job-details-jobs-unified-top-card__primary-description-container')?.innerText || ''
-            ''')
-
-            # Parse location info
-            location = None
-            posted_days_ago = None
-            ppl_applied = None
-            if len(second_head.split('·')) == 3:
-                location = second_head.split('·')[0].strip()
-                posted_days_ago = second_head.split('·')[1].strip()
-                ppl_applied = second_head.split('·')[2].strip()
-
-            # Get apply button information
-            apply_info = await page.evaluate('''(() => {
-                const applyButton = document.querySelector('.jobs-apply-button');
-                if (applyButton) {
-                    const buttonText = applyButton.querySelector('.artdeco-button__text')?.innerText || '';
-                    const isEasyApply = buttonText.includes('Easy Apply');
-                    if (isEasyApply) {
-                        return {
-                            link: `https://www.linkedin.com/jobs/view/${jobId}/`,
-                            type: 'Easy Apply'
-                        };
-                    }
-                    return {
-                        link: null,
-                        type: 'Apply'
-                    };
-                }
-                return {
-                    link: window.location.href,
-                    type: 'Unknown'
-                };
-            })()''')
-
-            # Handle regular Apply button (gets external URL)
-            if apply_info['type'] == 'Apply' and not apply_info['link']:
-                try:
-                    popup_promise = page.wait_for_event("popup")
-                    await page.click('.jobs-apply-button')
-                    popup = await popup_promise
-                    await popup.wait_for_load_state()
-                    apply_info['link'] = popup.url
-                    await popup.close()
-                except:
-                    apply_info['link'] = page.url
-
-            # Create Job object
+            # Extract job information
+            job_info = await self._extract_job_info(page)
+            apply_info = await self._get_apply_info(page)
+            
+            # Create and yield Job object
             job = Job(
                 job_id=job_id,
-                job_title=job_title,
-                company_name=company_name,
-                location=location,
-                posted_days_ago=posted_days_ago,
-                ppl_applied=ppl_applied,
-                apply_link=apply_info['link'],
-                apply_type=apply_info['type'],
-                raw_description=second_head
+                job_title=job_info["job_title"],
+                company_name=job_info["company_name"],
+                location=job_info["location"],
+                posted_days_ago=job_info["posted_days_ago"],
+                ppl_applied=job_info["ppl_applied"],
+                apply_link=apply_info["link"],
+                apply_type=apply_info["type"],
+                raw_description=job_info["raw_description"]
             )
             
             yield job

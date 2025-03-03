@@ -36,9 +36,11 @@ class Jobs(BaseModel):
     jobs: List[Job]
 
 controller_out = Controller(output_model=Job)
+print(os.getenv("CHROME_PATH"))
 
 browser_config = BrowserConfig(
-    chrome_instance_path=r"C:\Users\fish\git_project\Fireball\GoogleChromePortable\GoogleChromePortable.exe",
+    # chrome_instance_path=r"C:\Users\fish\git_project\Fireball\GoogleChromePortable\GoogleChromePortable.exe",
+    chrome_instance_path=os.getenv("CHROME_PATH"),
     disable_security=True,
 )
 context_config = BrowserContextConfig(
