@@ -96,21 +96,83 @@ async def main():
     # await asyncio.sleep(1)
     jobs_list = []
     
-    for area_index in range(1, 7):
+    page_num = 1
+    has_next_page = True
+    
+    # Get total number of pages
+    page = await context.get_current_page()
+    total_pages = await page.evaluate('''
+        (() => {
+            const pageState = document.querySelector('.jobs-search-pagination__page-state');
+            if (pageState) {
+                // Extract number from text like "Page 1 of 48"
+                const match = pageState.textContent.match(/Page \d+ of (\d+)/);
+                if (match) {
+                    return parseInt(match[1]);
+                }
+            }
+            return 1;  // Default to 1 if we can't find the page count
+        })()
+    ''')
+    print(f"\nTotal available pages: {total_pages}")
+    
+    max_pages = min(total_pages, 3)  # Limit to 3 pages for testing, adjust as needed
+    print(f"Will process up to {max_pages} pages")
+    
+    while has_next_page and page_num <= max_pages:
+        print(f"\nProcessing page {page_num} of {max_pages}")
         page = await context.get_current_page()
         
-        job_ids = await page.evaluate('''
-            Array.from(document.querySelectorAll("[data-job-id]"))
-                .map(element => element.getAttribute("data-job-id"))
-        ''')
-        print(job_ids)
-        jobs_list.extend(job_ids)
+        # Collect jobs on current page
+        for scroll_count in range(1, 7):
+            # Get job IDs in current view
+            job_ids = await page.evaluate('''
+                Array.from(document.querySelectorAll("[data-job-id]"))
+                    .map(element => element.getAttribute("data-job-id"))
+            ''')
+            print(f"Found {len(job_ids)} jobs on scroll {scroll_count}")
+            jobs_list.extend(job_ids)
 
-        await page.evaluate(f'window.scrollBy(0, 800);')
-        await asyncio.sleep(random.uniform(0.8, 1.8))
+            # Scroll down
+            await page.evaluate('window.scrollBy(0, 800);')
+            await asyncio.sleep(random.uniform(0.8, 1.8))
 
-    jobs_list = list(set(jobs_list))
+        # Remove duplicates
+        jobs_list = list(set(jobs_list))
+        print(f"Total unique jobs found so far: {len(jobs_list)}")
+        
+        # Try to go to next page if we haven't reached max_pages
+        if page_num < max_pages:
+            try:
+                # Check if next page button exists and is not disabled
+                next_button = await page.evaluate('''
+                    (() => {
+                        const button = document.querySelector('button[aria-label="View next page"]');
+                        if (!button || button.classList.contains('artdeco-button--disabled')) {
+                            return null;
+                        }
+                        return true;
+                    })()
+                ''')
+                
+                if next_button:
+                    print(f"Moving to page {page_num + 1}")
+                    # Click next page button
+                    await page.click('button[aria-label="View next page"]')
+                    await asyncio.sleep(2)  # Wait for page to load
+                    page_num += 1
+                else:
+                    has_next_page = False
+                    print("\nReached last page or no more results.")
+            except Exception as e:
+                print(f"\nError navigating to next page: {e}")
+                has_next_page = False
+        else:
+            has_next_page = False
+            print(f"\nReached maximum page limit ({max_pages})")
 
+    print(f"\nCollected {len(jobs_list)} unique job IDs across {page_num} pages (out of {total_pages} available pages)")
+    
     results_list = []
     for job_id in jobs_list:
         job_url = f'https://www.linkedin.com/jobs/search/?currentJobId={job_id}'
