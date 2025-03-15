@@ -41,24 +41,35 @@ async def main():
     
     # Use the default instance for this demo
     try:
+        print("\nStarting job search...")
+        print("Searching for: 'machine learning engineer' in United States")
+        print("Experience levels: entry, mid-senior")
+        
         # Search for Python developer jobs
-        jobs = await fireball.search_jobs(
-            keywords="python developer",
+        jobs = await fireball.search_jobs_simple_demo(
+            keywords="machine learning engineer",
             location="United States",
-            experience_levels=["ENTRY_LEVEL", "MID_SENIOR"]
+            experience_levels=["entry", "mid-senior"]
         )
         
+        print(f"\nFound {len(jobs)} jobs. Processing details...")
+        
         # Print results
-        for job in jobs:
-            print(f"\nFound job: {job['title']}")
+        for i, job in enumerate(jobs, 1):
+            print(f"\nProcessing job {i}/{len(jobs)}:")
+            print(f"Title: {job['job_title']}")
             print(f"Company: {job['company_name']}")
             print(f"Location: {job['location']}")
             print(f"Apply type: {job['apply_type']}")
             print(f"Apply link: {job['apply_link']}")
+            print(f"Posted: {job['posted_days_ago']}")
+            print(f"Applications: {job['ppl_applied']}")
+            print("-" * 50)
     
     finally:
-        # Clean up
+        print("\nClosing browser...")
         await fireball.close()
+        print("Done!")
 
 if __name__ == "__main__":
     asyncio.run(main()) 
